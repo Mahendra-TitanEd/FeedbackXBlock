@@ -19,6 +19,7 @@ from xblock.core import XBlock
 from xblock.fields import Scope, Integer, String, List, Float, Boolean, Dict
 from web_fragments.fragment import Fragment
 from feedback.utils import _
+from openedx.core.djangoapps.content.course_overviews.models import CourseOverview
 
 try:
     from xblock.utils.resources import ResourceLoader
@@ -611,23 +612,24 @@ class FeedbackXBlock(XBlock, CSVExportMixin):
     def prepare_data(self):
         header_row = [
             "course_id",
+            "course_name",
             "user_id",
             "username",
             "user_email",
             "Rating",
             "Feedback",
         ]
-        # rating_choice = {4: "Poor", 3: "Fair", 2: "Average", 1: "Good", 0: "Excellent"}
+        course = CourseOverview.objects.get(id=self.course_id)
         data = {}
         rating_choice = {}
         for i in range(5):
             rating_choice[i] = self.prompts[0]["scale_text"][i]
-
         for sm in self.student_module_queryset():
             choice = json.loads(sm.state)
             if sm.student.id not in data:
                 data[sm.student.id] = [
-                    getattr(self.runtime, "course_id", "course_id"),
+                    self.course_id,
+                    course.display_name,
                     sm.student.id,
                     sm.student.username,
                     sm.student.email,
