@@ -16,4 +16,11 @@
     </div>
     <button type="submit" class="feedback_submit_feedback">{% trans "Submit Feedback" %}</button>
   </form>
+  {% if can_view_private_results %}
+      <div class="export-results-button-wrapper">
+        <button class="export-feedback-results-button">{% trans "Export results to CSV" %}</button>
+        <button disabled class="download-feedback-results-button">{% trans "Download CSV" %}</button>
+        <p class="error-message poll-hidden"></p>
+      </div>
+  {% endif %}
 </div>

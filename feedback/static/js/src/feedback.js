@@ -56,4 +56,56 @@ function FeedbackXBlock(runtime, element) {
     $('.feedback_freeform_area', element).change(function(eventObject) {
 	Logger.log("edx.feedbackxblock.freeform_changed", {"freeform":feedback()});
     });
+
+    function getStatus() {
+        $.ajax({
+            type: 'POST',
+            url: runtime.handlerUrl(element, 'get_export_status'),
+            data: '{}',
+            success: updateStatus,
+            dataType: 'json'
+        });
+    }
+
+    var exportStatus = {};
+    function updateStatus(newStatus) {
+        var statusChanged = ! _.isEqual(newStatus, exportStatus);
+        exportStatus = newStatus;
+        if (exportStatus.export_pending) {
+            // Keep polling for status updates when an export is running.
+            setTimeout(getStatus, 1000);
+        }
+        else {
+            if (statusChanged) {
+                if (newStatus.last_export_result.error) {
+                    $('.error-message').text("Error: " + newStatus.last_export_result.error);
+                    $('.error-message').show();
+                } else {
+                    $(".download-feedback-results-button").attr('disabled', false);
+                    $('.error-message').hide()
+                }
+            }
+        }
+    }
+
+    var csv_export_url = runtime.handlerUrl(element, 'csv_export')
+	function exportCsv() {
+        $.ajax({
+            type: "POST",
+            url: csv_export_url,
+            data: JSON.stringify({}),
+            success: updateStatus
+        });
+    };
+
+    function downloadCsv() {
+        window.location = exportStatus.download_url;
+    };
+
+    $(".export-feedback-results-button", element).click(function(eventObject) {
+		exportCsv();
+    });
+    $(".download-feedback-results-button", element).click(function(eventObject) {
+		downloadCsv();
+    });
 }

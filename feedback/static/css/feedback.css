@@ -3,18 +3,19 @@
 /* Overall block. We limit width, and put a very faint
    border around it. */
 .feedback_block {
-    display: inline-block;
-    border-width: 1px;
-    border-style: solid;
-    border-color: rgba(0,0,0,0.1);
-    padding: 10px
+    display: block;
+    border: none;
 }
 
 /* Little thank you message div after people vote */
 .feedback_thank_you {
-    color: green;
+    color: #ff001b;
+    margin-top: 1rem;
 }
-
+.feedback_block .error-message{
+        color: #ff001b;
+    font-weight: 600;
+}
 /* Label for the freeform text input. We want a little
    space between this and the Likert input.*/
 .feedback_block .feedback_header_div {
@@ -112,11 +113,10 @@
 .feedback_block .feedback_likert_field {
     border-style:none;
 }
-.feedback_block .feedback_submit_feedback {
-    width:100%;
-}
 
 .feedback_likert_scale {
     display: flex;
     flex-direction: row;
 }
+
+.feedback_block .export-results-button-wrapper{cursor: auto; text-align: right;}

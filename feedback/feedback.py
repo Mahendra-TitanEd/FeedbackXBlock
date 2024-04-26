@@ -10,11 +10,16 @@ import html
 import random
 import pkg_resources
 import six
+import time
+import functools
+import json
+from collections import OrderedDict
 
 from xblock.core import XBlock
-from xblock.fields import Scope, Integer, String, List, Float, Boolean
+from xblock.fields import Scope, Integer, String, List, Float, Boolean, Dict
 from web_fragments.fragment import Fragment
 from feedback.utils import _
+
 try:
     from xblock.utils.resources import ResourceLoader
 except ModuleNotFoundError:  # For backward compatibility with releases older than Quince.
@@ -49,14 +54,142 @@ ICON_SETS = {
 }
 
 
-@XBlock.needs('i18n')
-class FeedbackXBlock(XBlock):
+class CSVExportMixin(object):
+    """
+    Allows Poll or Surveys XBlocks to support CSV downloads of all users'
+    details per block.
+    """
+
+    active_export_task_id = String(
+        # The UUID of the celery AsyncResult for the most recent export,
+        # IF we are sill waiting for it to finish
+        default="",
+        scope=Scope.user_state_summary,
+    )
+    last_export_result = Dict(
+        # The info dict returned by the most recent successful export.
+        # If the export failed, it will have an "error" key set.
+        default=None,
+        scope=Scope.user_state_summary,
+    )
+
+    @XBlock.json_handler
+    def csv_export(self, data, suffix=""):
+        """
+        Asynchronously export given data as a CSV file.
+        """
+        # Launch task
+        from .tasks import export_csv_data  # Import here since this is edX LMS specific
+
+        # Make sure we nail down our state before sending off an asynchronous task.
+        async_result = export_csv_data.delay(
+            six.text_type(getattr(self.scope_ids, "usage_id", None)),
+            six.text_type(getattr(self.runtime, "course_id", "course_id")),
+        )
+        if not async_result.ready():
+            self.active_export_task_id = async_result.id
+        else:
+            self._store_export_result(async_result)
+
+        return self._get_export_status()
+
+    @XBlock.json_handler
+    def get_export_status(self, data, suffix=""):
+        """
+        Return current export's pending status, previous result,
+        and the download URL.
+        """
+        return self._get_export_status()
+
+    def _get_export_status(self):
+        self.check_pending_export()
+        return {
+            "export_pending": bool(self.active_export_task_id),
+            "last_export_result": self.last_export_result,
+            "download_url": self.download_url_for_last_report,
+        }
+
+    def check_pending_export(self):
+        """
+        If we're waiting for an export, see if it has finished, and if so, get the result.
+        """
+        from .tasks import export_csv_data  # Import here since this is edX LMS specific
+
+        if self.active_export_task_id:
+            async_result = export_csv_data.AsyncResult(self.active_export_task_id)
+            if async_result.ready():
+                self._store_export_result(async_result)
+
+    @property
+    def download_url_for_last_report(self):
+        """Get the URL for the last report, if any"""
+        from lms.djangoapps.instructor_task.models import (
+            ReportStore,
+        )  # pylint: disable=import-error
+
+        # Unfortunately this is a bit inefficient due to the ReportStore API
+        if not self.last_export_result or self.last_export_result["error"] is not None:
+            return None
+
+        report_store = ReportStore.from_config(config_name="GRADES_DOWNLOAD")
+        course_key = getattr(self.scope_ids.usage_id, "course_key", None)
+        return dict(report_store.links_for(course_key)).get(
+            self.last_export_result["report_filename"]
+        )
+
+    def student_module_queryset(self):
+        try:
+            from lms.djangoapps.courseware.models import (
+                StudentModule,
+            )  # pylint: disable=import-error
+        except RuntimeError:
+            from courseware.models import StudentModule
+        return (
+            StudentModule.objects.select_related("student")
+            .filter(
+                course_id=self.runtime.course_id,
+                module_state_key=self.scope_ids.usage_id,
+            )
+            .order_by("-modified")
+        )
+
+    def _store_export_result(self, task_result):
+        """Given an AsyncResult or EagerResult, save it."""
+        self.active_export_task_id = ""
+        if task_result.successful():
+            if isinstance(task_result.result, dict) and not task_result.result.get(
+                "error"
+            ):
+                self.last_export_result = task_result.result
+            else:
+                self.last_export_result = {
+                    "error": "Unexpected result: {}".format(repr(task_result.result))
+                }
+        else:
+            self.last_export_result = {"error": six.text_type(task_result.result)}
+
+    def prepare_data(self):
+        """
+        Return a two-dimensional list containing cells of data ready for CSV export.
+        """
+        raise NotImplementedError
+
+    def get_filename(self):
+        """
+        Return a string to be used as the filename for the CSV export.
+        """
+        raise NotImplementedError
+
+
+@XBlock.needs("i18n")
+class FeedbackXBlock(XBlock, CSVExportMixin):
     """
     This is an XBlock -- eventually, hopefully an aside -- which
     allows you to feedback content in the course. We've wanted this for a
     long time, but Dartmouth finally encourage me to start to build
     this.
     """
+
     # This is a list of prompts. If we have multiple elements in the
     # list, one will be chosen at random. This is currently not
     # exposed in the UX. If the prompt is missing any portions, we
@@ -74,60 +207,60 @@ class FeedbackXBlock(XBlock):
         ],
         scope=Scope.settings,
         help=_("Freeform user prompt"),
-        xml_node=True
+        xml_node=True,
     )
 
     prompt_choice = Integer(
-        default=-1, scope=Scope.user_state,
-        help=_("Random number generated for p. -1 if uninitialized")
+        default=-1,
+        scope=Scope.user_state,
+        help=_("Random number generated for p. -1 if uninitialized"),
     )
 
     user_vote = Integer(
-        default=-1, scope=Scope.user_state,
-        help=_("How user voted. -1 if didn't vote")
+        default=-1, scope=Scope.user_state, help=_("How user voted. -1 if didn't vote")
     )
 
     # pylint: disable=invalid-name
     p = Float(
-        default=100, scope=Scope.settings,
-        help=_("What percent of the time should this show?")
+        default=100,
+        scope=Scope.settings,
+        help=_("What percent of the time should this show?"),
     )
 
     p_user = Float(
-        default=-1, scope=Scope.user_state,
-        help=_("Random number generated for p. -1 if uninitialized")
+        default=-1,
+        scope=Scope.user_state,
+        help=_("Random number generated for p. -1 if uninitialized"),
     )
 
     vote_aggregate = List(
-        default=None, scope=Scope.user_state_summary,
-        help=_("A list of user votes")
+        default=None, scope=Scope.user_state_summary, help=_("A list of user votes")
     )
 
-    user_freeform = String(default="", scope=Scope.user_state,
-                           help=_("Feedback"))
+    user_freeform = String(default="", scope=Scope.user_state, help=_("Feedback"))
 
     display_name = String(
         display_name=_("Display Name"),
         default=_("Provide Feedback"),
-        scopde=Scope.settings
+        scopde=Scope.settings,
     )
 
     voting_message = String(
         display_name=_("Voting message"),
         default=_("Thank you for voting!"),
-        scope=Scope.settings
+        scope=Scope.settings,
     )
 
     feedback_message = String(
         display_name=_("Feedback message"),
         default=_("Thank you for your feedback!"),
-        scope=Scope.settings
+        scope=Scope.settings,
     )
 
     show_aggregate_to_students = Boolean(
         display_name=_("Show aggregate to students"),
         default=False,
-        scope=Scope.settings
+        scope=Scope.settings,
     )
 
     @classmethod
@@ -145,7 +278,7 @@ class FeedbackXBlock(XBlock):
         if index == -1:
             index = self.prompt_choice
 
-        _ = self.runtime.service(self, 'i18n').ugettext
+        _ = self.runtime.service(self, "i18n").ugettext
         # This is the default prompt if something is not specified in the
         # settings dictionary. Note that this is not the same as the default
         # above. The default above is the prompt the instructor starts from
@@ -155,22 +288,38 @@ class FeedbackXBlock(XBlock):
         # intended as a well-structured, coherent response. This is designed
         # as generic, to work with any content as a safe fallback.
         prompt = {
-            'freeform': _("Please reflect on this course material"),
-            'default_text': _("Please take time to meaningfully reflect "
-                              "on your experience with this course "
-                              "material."),
-            'likert': _("Please rate your overall experience"),
-            'scale_text': [_("Excellent"),
-                           _("Good"),
-                           _("Average"),
-                           _("Fair"),
-                           _("Poor")],
-            'icon_set': 'num',
-            'placeholder': _("Please take a moment to thoughtfully reflect.")
+            "freeform": _("Please reflect on this course material"),
+            "default_text": _(
+                "Please take time to meaningfully reflect "
+                "on your experience with this course "
+                "material."
+            ),
+            "likert": _("Please rate your overall experience"),
+            "scale_text": [
+                _("Excellent"),
+                _("Good"),
+                _("Average"),
+                _("Fair"),
+                _("Poor"),
+            ],
+            "icon_set": "num",
+            "placeholder": _("Please take a moment to thoughtfully reflect."),
         }
 
         prompt.update(self.prompts[index])
         return prompt
+
+    def can_view_private_results(self):
+        """
+        Checks to see if the user has permissions to view private results.
+        This only works inside the LMS.
+        """
+        if not hasattr(self.runtime, "user_is_staff"):
+            return False
+
+        # Course staff users have permission to view results.
+        if self.runtime.user_is_staff:
+            return True
 
     def student_view(self, context=None):  # pylint: disable=unused-argument
         """
@@ -196,8 +345,7 @@ class FeedbackXBlock(XBlock):
         indexes = range(5)
 
         # If the user voted before, we'd like to show that
-        active_vote = ["checked" if i == self.user_vote else ""
-                       for i in indexes]
+        active_vote = ["checked" if i == self.user_vote else "" for i in indexes]
 
         # Confirm that we do have vote totals (this may be uninitialized
         # otherwise). This should probably go into __init__ or similar.
@@ -207,7 +355,7 @@ class FeedbackXBlock(XBlock):
         # We grab the icons. This should move to a Filesystem field so
         # instructors can upload new ones
         def get_url(icon_type, i):
-            '''
+            """
             Helper function to generate the URL for the icons shown in the
             tool. Takes the type of icon (active, inactive, etc.) and
             the number of the icon.
@@ -215,49 +363,53 @@ class FeedbackXBlock(XBlock):
             Note that some icon types may not be actively used in the
             styling. For example, at the time of this writing, we do
             selected through CSS, rather than by using those icons.
-            '''
+            """
             templates = {
-                'inactive': 'public/default_icons/i{set}{i}.png',
-                'active': 'public/default_icons/a{set}{i}.png',
+                "inactive": "public/default_icons/i{set}{i}.png",
+                "active": "public/default_icons/a{set}{i}.png",
             }
             template = templates[icon_type]
-            icon_file = template.format(i=i, set=prompt['icon_set'])
+            icon_file = template.format(i=i, set=prompt["icon_set"])
             return self.runtime.local_resource_url(self, icon_file)
-        ina_urls = [get_url('inactive', i) for i in range(1, 6)]
-        act_urls = [get_url('active', i) for i in range(1, 6)]
+
+        ina_urls = [get_url("inactive", i) for i in range(1, 6)]
+        act_urls = [get_url("active", i) for i in range(1, 6)]
 
         # Prepare the Likert scale fragment to be embedded into the feedback form
         scale = "".join(
             resource_loader.render_django_template(
                 item_templates_file,
                 {
-                    'scale_text': scale_text,
-                    'unicode_icon': unicode_icon,
-                    'idx': idx,
-                    'active': active,
-                    'vote_cnt': vote_cnt,
-                    'ina_icon': ina_icon,
-                    'act_icon': act_icon,
+                    "scale_text": scale_text,
+                    "unicode_icon": unicode_icon,
+                    "idx": idx,
+                    "active": active,
+                    "vote_cnt": vote_cnt,
+                    "ina_icon": ina_icon,
+                    "act_icon": act_icon,
                 },
-                i18n_service=self.runtime.service(self, 'i18n'),
-            ) for
-            (scale_text,
-             unicode_icon,
-             idx,
-             active,
-             vote_cnt,
-             act_icon,
-             ina_icon,) in
-            zip(prompt['scale_text'],
-                ICON_SETS[(prompt['icon_set'])],
+                i18n_service=self.runtime.service(self, "i18n"),
+            )
+            for (
+                scale_text,
+                unicode_icon,
+                idx,
+                active,
+                vote_cnt,
+                act_icon,
+                ina_icon,
+            ) in zip(
+                prompt["scale_text"],
+                ICON_SETS[(prompt["icon_set"])],
                 indexes,
                 active_vote,
                 votes,
                 act_urls,
-                ina_urls)
+                ina_urls,
+            )
         )
         if self.user_vote != -1:
-            _ = self.runtime.service(self, 'i18n').ugettext
+            _ = self.runtime.service(self, "i18n").ugettext
             response = self.voting_message
         else:
             response = ""
@@ -271,26 +423,29 @@ class FeedbackXBlock(XBlock):
             self.p_user = random.uniform(0, 100)
         if self.p_user < self.p:
             frag = Fragment()
-            frag.add_content(resource_loader.render_django_template(
-                'templates/html/feedback.html',
-                context={
-                    'self': self,
-                    'scale': scale,
-                    'freeform_prompt': prompt['freeform'],
-                    'likert_prompt': prompt['likert'],
-                    'response': response,
-                    'placeholder': prompt['placeholder']
-                },
-                i18n_service=self.runtime.service(self, 'i18n')
-            ))
+            frag.add_content(
+                resource_loader.render_django_template(
+                    "templates/html/feedback.html",
+                    context={
+                        "self": self,
+                        "scale": scale,
+                        "freeform_prompt": prompt["freeform"],
+                        "likert_prompt": prompt["likert"],
+                        "response": response,
+                        "placeholder": prompt["placeholder"],
+                        "can_view_private_results": self.can_view_private_results(),
+                    },
+                    i18n_service=self.runtime.service(self, "i18n"),
+                )
+            )
         else:
-            frag = Fragment('')
+            frag = Fragment("")
 
         # Finally, we do the standard JS+CSS boilerplate. Honestly, XBlocks
         # ought to have a sane default here.
         frag.add_css(self.resource_string("static/css/feedback.css"))
         frag.add_javascript(self.resource_string("static/js/src/feedback.js"))
-        frag.initialize_js('FeedbackXBlock')
+        frag.initialize_js("FeedbackXBlock")
         return frag
 
     def studio_view(self, context):  # pylint: disable=unused-argument
@@ -298,59 +453,61 @@ class FeedbackXBlock(XBlock):
         Create a fragment used to display the edit view in the Studio.
         """
         prompt = self.get_prompt(0)
-        for idx in range(len(prompt['scale_text'])):
-            prompt['likert{i}'.format(i=idx)] = prompt['scale_text'][idx]
+        for idx in range(len(prompt["scale_text"])):
+            prompt["likert{i}".format(i=idx)] = prompt["scale_text"][idx]
         frag = Fragment()
 
-        prompt.update({
-            "display_name": self.display_name,
-            "voting_message": self.voting_message,
-            "feedback_message": self.feedback_message,
-            "show_aggregate_to_students": self.show_aggregate_to_students,
-        })
-        frag.add_content(resource_loader.render_django_template(
-            'templates/html/studio_view.html',
-            prompt,
-            i18n_service=self.runtime.service(self, 'i18n')
-        ))
+        prompt.update(
+            {
+                "display_name": self.display_name,
+                "voting_message": self.voting_message,
+                "feedback_message": self.feedback_message,
+                "show_aggregate_to_students": self.show_aggregate_to_students,
+            }
+        )
+        frag.add_content(
+            resource_loader.render_django_template(
+                "templates/html/studio_view.html",
+                prompt,
+                i18n_service=self.runtime.service(self, "i18n"),
+            )
+        )
         js_str = self.resource_string("static/js/src/studio.js")
         frag.add_javascript(six.text_type(js_str))
-        frag.initialize_js('FeedbackBlock',
-                           {'icon_set': prompt['icon_set']})
+        frag.initialize_js("FeedbackBlock", {"icon_set": prompt["icon_set"]})
         return frag
 
     @XBlock.json_handler
-    def studio_submit(self,
-                      data, suffix=''):  # pylint: disable=unused-argument
+    def studio_submit(self, data, suffix=""):  # pylint: disable=unused-argument
         """
         Called when submitting the form in Studio.
         """
-        for item in ['freeform', 'likert', 'placeholder', 'icon_set']:
+        for item in ["freeform", "likert", "placeholder", "icon_set"]:
             item_submission = data.get(item, None)
             if item_submission and len(item_submission) > 0:
                 self.prompts[0][item] = html.escape(item_submission)
         for i in range(5):
-            likert = data.get('likert{i}'.format(i=i), None)
+            likert = data.get("likert{i}".format(i=i), None)
             if likert and len(likert) > 0:
-                self.prompts[0]['scale_text'][i] = html.escape(likert)
+                self.prompts[0]["scale_text"][i] = html.escape(likert)
 
-        self.display_name = data.get('display_name')
-        self.voting_message = data.get('voting_message')
-        self.feedback_message = data.get('feedback_message')
+        self.display_name = data.get("display_name")
+        self.voting_message = data.get("voting_message")
+        self.feedback_message = data.get("feedback_message")
         self.show_aggregate_to_students = data.get("show_aggregate_to_students")
 
-        return {'result': 'success'}
+        return {"result": "success"}
 
     def init_vote_aggregate(self):
-        '''
+        """
         There are a lot of places we read the aggregate vote counts. We
         start out with these uninitialized. This guarantees they are
         initialized. We'd prefer to do it this way, rather than default
         value, since we do plan to not force scale length to be 5 in the
         future.
-        '''
+        """
         if not self.vote_aggregate:
-            self.vote_aggregate = [0] * (len(self.get_prompt()['scale_text']))
+            self.vote_aggregate = [0] * (len(self.get_prompt()["scale_text"]))
 
     def vote(self, data):
         """
@@ -367,12 +524,12 @@ class FeedbackXBlock(XBlock):
         if self.user_vote != -1:
             self.vote_aggregate[self.user_vote] -= 1
 
-        self.user_vote = data['vote']
+        self.user_vote = data["vote"]
         self.vote_aggregate[self.user_vote] += 1
 
     @XBlock.json_handler
-    def feedback(self, data, suffix=''):  # pylint: disable=unused-argument
-        '''
+    def feedback(self, data, suffix=""):  # pylint: disable=unused-argument
+        """
         Allow students to submit feedback, both numerical and
         qualitative. We only update the specific type of feedback
         submitted.
@@ -380,39 +537,33 @@ class FeedbackXBlock(XBlock):
         We return the current state. While this is not used by the
         client code, it is helpful for testing. For staff users, we
         also return the aggregate results.
-        '''
-        _ = self.runtime.service(self, 'i18n').ugettext
+        """
+        _ = self.runtime.service(self, "i18n").ugettext
 
-        if 'freeform' not in data and 'vote' not in data:
-            response = {"success": False,
-                        "response": _("Please vote!")}
-            self.runtime.publish(self,
-                                 'edx.feedbackxblock.nothing_provided',
-                                 {})
-        if 'vote' in data:
-            response = {"success": True,
-                        "response": self.voting_message}
-            self.runtime.publish(self,
-                                 'edx.feedbackxblock.likert_provided',
-                                 {'old_vote': self.user_vote,
-                                  'new_vote': data['vote']})
+        if "freeform" not in data and "vote" not in data:
+            response = {"success": False, "response": _("Please vote!")}
+            self.runtime.publish(self, "edx.feedbackxblock.nothing_provided", {})
+        if "vote" in data:
+            response = {"success": True, "response": self.voting_message}
+            self.runtime.publish(
+                self,
+                "edx.feedbackxblock.likert_provided",
+                {"old_vote": self.user_vote, "new_vote": data["vote"]},
+            )
             self.vote(data)
-        if 'freeform' in data:
-            response = {"success": True,
-                        "response": self.feedback_message}
-            self.runtime.publish(self,
-                                 'edx.feedbackxblock.freeform_provided',
-                                 {'old_freeform': self.user_freeform,
-                                  'new_freeform': data['freeform']})
-            self.user_freeform = data['freeform']
+        if "freeform" in data:
+            response = {"success": True, "response": self.feedback_message}
+            self.runtime.publish(
+                self,
+                "edx.feedbackxblock.freeform_provided",
+                {"old_freeform": self.user_freeform, "new_freeform": data["freeform"]},
+            )
+            self.user_freeform = data["freeform"]
 
-        response.update({
-            "freeform": self.user_freeform,
-            "vote": self.user_vote
-        })
+        response.update({"freeform": self.user_freeform, "vote": self.user_vote})
 
         if self.is_staff():
-            response['aggregate'] = self.vote_aggregate
+            response["aggregate"] = self.vote_aggregate
 
         return response
 
@@ -425,13 +576,15 @@ class FeedbackXBlock(XBlock):
         other two show up 50% of the time.
         """
         return [
-            ("FeedbackXBlock",
-             """<vertical_demo>
+            (
+                "FeedbackXBlock",
+                """<vertical_demo>
                 <feedback p="100"/>
                 <feedback p="50"/>
                 <feedback p="50"/>
                 </vertical_demo>
-             """),
+             """,
+            ),
         ]
 
     def is_staff(self):
@@ -442,9 +595,43 @@ class FeedbackXBlock(XBlock):
         runtimes, and this is a workaround so something reasonable
         happens in both workbench and edx-platform
         """
-        if hasattr(self, "xmodule_runtime") and \
-           hasattr(self.xmodule_runtime, "user_is_staff"):
+        if hasattr(self, "xmodule_runtime") and hasattr(
+            self.xmodule_runtime, "user_is_staff"
+        ):
             return self.xmodule_runtime.user_is_staff
         else:
             # In workbench and similar settings, always return true
             return True
+
+    def get_filename(self):
+        return "feedback-data-export-{}.csv".format(
+            time.strftime("%Y-%m-%d-%H%M%S", time.gmtime(time.time()))
+        )
+
+    def prepare_data(self):
+        header_row = [
+            "course_id",
+            "user_id",
+            "username",
+            "user_email",
+            "Rating",
+            "Feedback",
+        ]
+        # rating_choice = {4: "Poor", 3: "Fair", 2: "Average", 1: "Good", 0: "Excellent"}
+        data = {}
+        rating_choice = {}
+        for i in range(5):
+            rating_choice[i] = self.prompts[0]["scale_text"][i]
+
+        for sm in self.student_module_queryset():
+            choice = json.loads(sm.state)
+            if sm.student.id not in data:
+                data[sm.student.id] = [
+                    getattr(self.runtime, "course_id", "course_id"),
+                    sm.student.id,
+                    sm.student.username,
+                    sm.student.email,
+                    rating_choice.get(choice.get("user_vote")),
+                    choice.get("user_freeform", ""),
+                ]
+        return [header_row] + list(data.values())
